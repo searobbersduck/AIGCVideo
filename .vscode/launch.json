@@ -1,0 +1,47 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }, 
+        {
+            "name": "VideoComposer",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${fileDirname}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--cfg", "configs/exp02_motion_transfer.yaml", 
+                "--seed",  "9999", 
+                "--input_video", "demo_video/motion_transfer.mp4", 
+                "--image_path", "demo_video/moon_on_water.jpg", 
+                "--input_text_desc",  "A beautiful big moon on the water at night"
+            ]
+        },
+        {
+            "name": "AIGCVideo_zeroscope",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${fileDirname}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+            ]
+        },
+    ]
+}
