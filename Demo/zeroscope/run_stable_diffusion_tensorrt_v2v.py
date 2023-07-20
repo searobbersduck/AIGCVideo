@@ -789,7 +789,7 @@ class TensorRTVideoToVideoSDPipeline(VideoToVideoSDPipeline):
         self.vae.forward = self.vae.decode
 
         # stages = ['unet']
-        # stages = ["vae", "vae_encoder"]
+        # stages = ['clip', "vae", "vae_encoder"]
         self.stages = stages
         self.image_height, self.image_width = image_height, image_width
         self.frame_num = frame_num
@@ -887,7 +887,20 @@ class TensorRTVideoToVideoSDPipeline(VideoToVideoSDPipeline):
 
         return self
 
-
+    def __denoise_latent(
+        self, latents, text_embeddings, timesteps=None, step_offset=0, mask=None, masked_image_latents=None
+    ):
+        if not isinstance(timesteps, torch.Tensor):
+            timesteps = self.scheduler.timesteps
+        for step_index, timestep in enumerate(timesteps):
+            latent_model_input = torch.cat([latents] * 2)
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep)
+            sample_inp = device_view(latent_model_input)
+            timestep_inp = device_view(timestep_float)
+            embeddings_inp = device_view(text_embeddings)
+                        
+            
+                    
 
 pipe = DiffusionPipeline.from_pretrained("cerspense/zeroscope_v2_XL", 
                                          torch_dtype=torch.float32)
@@ -918,5 +931,6 @@ v2v_pipe = TensorRTVideoToVideoSDPipeline(
 v2v_pipe.set_cached_folder('/workspace/code/aigc/text2video/AIGCVideo/Demo/zeroscope/xxx')
 v2v_pipe.to('cuda')
 
+text_embedding = 
 
 print('congratulations!')
