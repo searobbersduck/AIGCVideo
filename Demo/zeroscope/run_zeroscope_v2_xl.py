@@ -11,6 +11,8 @@ import PIL
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 
+import time
+
 def tensor2vid(video: torch.Tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> List[np.ndarray]:
     # This code is copied from https://github.com/modelscope/modelscope/blob/1509fdb973e5871f37148a4b5e5964cafd43e64d/modelscope/pipelines/multi_modal/text_to_video_synthesis_pipeline.py#L78
     # reshape to ncfhw
@@ -74,8 +76,8 @@ pipe = DiffusionPipeline.from_pretrained("cerspense/zeroscope_v2_576w", torch_dt
 pipe.enable_model_cpu_offload()
 
 # memory optimization
-pipe.unet.enable_forward_chunking(chunk_size=1, dim=1)
-pipe.enable_vae_slicing()
+# pipe.unet.enable_forward_chunking(chunk_size=1, dim=1)
+# pipe.enable_vae_slicing()
 
 prompt = "Darth Vader surfing a wave"
 video_frames = pipe(prompt, num_frames=12).frames
@@ -88,67 +90,75 @@ pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 pipe.enable_model_cpu_offload()
 
 # memory optimization
-pipe.unet.enable_forward_chunking(chunk_size=1, dim=1)
-pipe.enable_vae_slicing()
+# pipe.unet.enable_forward_chunking(chunk_size=1, dim=1)
+# pipe.enable_vae_slicing()
 
-video = [Image.fromarray(frame).resize((1024, 576)) for frame in video_frames]
-
-
-
-num_images_per_prompt = 1
-
-batch_size = 1
-
-device = pipe._execution_device
-
-guidance_scale = 15.0
-do_classifier_free_guidance = guidance_scale > 1.0
-
-negative_prompt = None
-prompt_embeds = None
-negative_prompt_embeds = None
-
-cross_attention_kwargs = None
-
-text_encoder_lora_scale = (
-    cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
-)
+# video = [Image.fromarray(frame).resize((1024, 576)) for frame in video_frames]
+video = [Image.fromarray(frame).resize((512, 512)) for frame in video_frames]
 
 
-# prompt_embeds.shape: torch.Size([2, 77, 1024])
-prompt_embeds = pipe._encode_prompt(
-    prompt, 
-    device, 
-    num_images_per_prompt,
-    do_classifier_free_guidance,
-    negative_prompt, 
-    prompt_embeds=prompt_embeds, 
-    negative_prompt_embeds=negative_prompt_embeds, 
-    lora_scale=text_encoder_lora_scale
-)
+beg = time.time()
+video_frames = pipe(prompt, video=video, strength=1).frames
+end = time.time()
 
-# video.shape: torch.Size([1, 3, 12, 576, 1024])
-video = preprocess_video(video)
+print('time elapsed:\t{:.4f}s'.format(end-beg))
 
-num_inference_steps = 50
-strength = 0.6
+video_path = export_to_video(video_frames, output_video_path="./video_12_512_512.mp4")
 
-pipe.scheduler.set_timesteps(num_inference_steps, device=device)
-timesteps, num_inference_steps = pipe.get_timesteps(num_inference_steps, strength, device)
-latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+# num_images_per_prompt = 1
 
-generator = None
+# batch_size = 1
 
-# 5. Prepare latent variables
-# latents.shape: torch.Size([1, 3, 12, 576, 1024])
-latents = pipe.prepare_latents(video, latent_timestep, batch_size, prompt_embeds.dtype, device, generator)
+# device = pipe._execution_device
+
+# guidance_scale = 15.0
+# do_classifier_free_guidance = guidance_scale > 1.0
+
+# negative_prompt = None
+# prompt_embeds = None
+# negative_prompt_embeds = None
+
+# cross_attention_kwargs = None
+
+# text_encoder_lora_scale = (
+#     cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+# )
 
 
-eta = 0.0
-extra_step_kwargs = pipe.prepare_extra_step_kwargs(generator, eta)
+# # prompt_embeds.shape: torch.Size([2, 77, 1024])
+# prompt_embeds = pipe._encode_prompt(
+#     prompt, 
+#     device, 
+#     num_images_per_prompt,
+#     do_classifier_free_guidance,
+#     negative_prompt, 
+#     prompt_embeds=prompt_embeds, 
+#     negative_prompt_embeds=negative_prompt_embeds, 
+#     lora_scale=text_encoder_lora_scale
+# )
 
-num_warmup_steps = len(timesteps) - num_inference_steps * pipe.scheduler.order
+# # video.shape: torch.Size([1, 3, 12, 576, 1024])
+# video = preprocess_video(video)
 
-video_frames = pipe(prompt, video=video, strength=0.6).frames
-video_path = export_to_video(video_frames)
-video_path
+# num_inference_steps = 50
+# strength = 0.6
+
+# pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+# timesteps, num_inference_steps = pipe.get_timesteps(num_inference_steps, strength, device)
+# latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+# generator = None
+
+# # 5. Prepare latent variables
+# # latents.shape: torch.Size([1, 3, 12, 576, 1024])
+# latents = pipe.prepare_latents(video, latent_timestep, batch_size, prompt_embeds.dtype, device, generator)
+
+
+# eta = 0.0
+# extra_step_kwargs = pipe.prepare_extra_step_kwargs(generator, eta)
+
+# num_warmup_steps = len(timesteps) - num_inference_steps * pipe.scheduler.order
+
+# video_frames = pipe(prompt, video=video, strength=0.6).frames
+# video_path = export_to_video(video_frames)
+# video_path

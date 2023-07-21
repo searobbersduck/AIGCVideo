@@ -16,6 +16,7 @@ pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 # pipe.unet.enable_forward_chunking(chunk_size=1, dim=1)
 # pipe.enable_vae_slicing()
 
+from tqdm import tqdm
 
 import gc
 import os
@@ -53,11 +54,14 @@ from diffusers.pipelines.stable_diffusion import (
 )
 
 from diffusers.pipelines.text_to_video_synthesis import (
-    VideoToVideoSDPipeline
+    VideoToVideoSDPipeline,
+    TextToVideoSDPipelineOutput
 )
 
 from diffusers.schedulers import DDIMScheduler, KarrasDiffusionSchedulers
 from diffusers.utils import DIFFUSERS_CACHE, logging
+
+import time
 
 
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
@@ -101,6 +105,63 @@ def preprocess_image(image):
     image = torch.from_numpy(image).contiguous()
     return 2.0 * image - 1.0
 
+def tensor2vid(video: torch.Tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> List[np.ndarray]:
+    # This code is copied from https://github.com/modelscope/modelscope/blob/1509fdb973e5871f37148a4b5e5964cafd43e64d/modelscope/pipelines/multi_modal/text_to_video_synthesis_pipeline.py#L78
+    # reshape to ncfhw
+    mean = torch.tensor(mean, device=video.device).reshape(1, -1, 1, 1, 1)
+    std = torch.tensor(std, device=video.device).reshape(1, -1, 1, 1, 1)
+    # unnormalize back to [0,1]
+    video = video.mul_(std).add_(mean)
+    video.clamp_(0, 1)
+    # prepare the final outputs
+    i, c, f, h, w = video.shape
+    images = video.permute(2, 3, 0, 4, 1).reshape(
+        f, h, i * w, c
+    )  # 1st (frames, h, batch_size, w, c) 2nd (frames, h, batch_size * w, c)
+    images = images.unbind(dim=0)  # prepare a list of indvidual (consecutive frames)
+    images = [(image.cpu().numpy() * 255).astype("uint8") for image in images]  # f h w c
+    return images
+
+
+def preprocess_video(video):
+    supported_formats = (np.ndarray, torch.Tensor, PIL.Image.Image)
+
+    if isinstance(video, supported_formats):
+        video = [video]
+    elif not (isinstance(video, list) and all(isinstance(i, supported_formats) for i in video)):
+        raise ValueError(
+            f"Input is in incorrect format: {[type(i) for i in video]}. Currently, we only support {', '.join(supported_formats)}"
+        )
+
+    if isinstance(video[0], PIL.Image.Image):
+        video = [np.array(frame) for frame in video]
+
+    if isinstance(video[0], np.ndarray):
+        video = np.concatenate(video, axis=0) if video[0].ndim == 5 else np.stack(video, axis=0)
+
+        if video.dtype == np.uint8:
+            video = np.array(video).astype(np.float32) / 255.0
+
+        if video.ndim == 4:
+            video = video[None, ...]
+
+        video = torch.from_numpy(video.transpose(0, 4, 1, 2, 3))
+
+    elif isinstance(video[0], torch.Tensor):
+        video = torch.cat(video, axis=0) if video[0].ndim == 5 else torch.stack(video, axis=0)
+
+        # don't need any preprocess if the video is latents
+        channel = video.shape[1]
+        if channel == 4:
+            return video
+
+        # move channels before num_frames
+        video = video.permute(0, 2, 1, 3, 4)
+
+    # normalize video
+    video = 2.0 * video - 1.0
+
+    return video
 
 
 class Engine:
@@ -664,8 +725,8 @@ class VAE(BaseModel):
     def get_shape_dict(self, batch_size, frame_num, image_height, image_width):
         latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
         return {
-            "latent": (batch_size, 4, frame_num, latent_height, latent_width),
-            "images": (batch_size, 3, frame_num, image_height, image_width),
+            "latent": (batch_size * frame_num, 4, latent_height, latent_width),
+            "images": (batch_size * frame_num, 3, image_height, image_width),
         }
 
     def get_sample_input(self, batch_size,  frame_num, image_height, image_width):
@@ -790,6 +851,8 @@ class TensorRTVideoToVideoSDPipeline(VideoToVideoSDPipeline):
 
         # stages = ['unet']
         # stages = ['clip', "vae", "vae_encoder"]
+        # stages = ['vae_encoder']
+        # stages = ['clip']
         self.stages = stages
         self.image_height, self.image_width = image_height, image_width
         self.frame_num = frame_num
@@ -887,18 +950,232 @@ class TensorRTVideoToVideoSDPipeline(VideoToVideoSDPipeline):
 
         return self
 
+
+    def __initialize_timesteps(self, timesteps, strength):
+        self.scheduler.set_timesteps(timesteps)
+        offset = self.scheduler.steps_offset if hasattr(self.scheduler, "steps_offset") else 0
+        init_timestep = int(timesteps * strength) + offset
+        init_timestep = min(init_timestep, timesteps)
+        t_start = max(timesteps - init_timestep + offset, 0)
+        timesteps = self.scheduler.timesteps[t_start:].to(self.torch_device)
+        return timesteps, t_start
+    
+
+
+    def __encode_image(self, init_image):
+        init_latents = runEngine(self.engine["vae_encoder"], {"images": device_view(init_image)}, self.stream)[
+            "latent"
+        ]
+        init_latents = 0.18215 * init_latents
+        return init_latents
+
+    def __encode_prompt(self, prompt, negative_prompt):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+             prompt (`str` or `List[str]`, *optional*):
+                prompt to be encoded
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. If not defined, one has to pass
+                `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
+                Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+        """
+        # Tokenize prompt
+        text_input_ids = (
+            self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            .input_ids.type(torch.int32)
+            .to(self.torch_device)
+        )
+
+        text_input_ids_inp = device_view(text_input_ids)
+        # NOTE: output tensor for CLIP must be cloned because it will be overwritten when called again for negative prompt
+        text_embeddings = runEngine(self.engine["clip"], {"input_ids": text_input_ids_inp}, self.stream)[
+            "text_embeddings"
+        ].clone()
+
+        # Tokenize negative prompt
+        uncond_input_ids = (
+            self.tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            .input_ids.type(torch.int32)
+            .to(self.torch_device)
+        )
+        uncond_input_ids_inp = device_view(uncond_input_ids)
+        uncond_embeddings = runEngine(self.engine["clip"], {"input_ids": uncond_input_ids_inp}, self.stream)[
+            "text_embeddings"
+        ]
+
+        # Concatenate the unconditional and text embeddings into a single batch to avoid doing two forward passes for classifier free guidance
+        # text_embeddings = torch.cat([uncond_embeddings, text_embeddings]).to(dtype=torch.float16)
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+        return text_embeddings
+
+
+
     def __denoise_latent(
         self, latents, text_embeddings, timesteps=None, step_offset=0, mask=None, masked_image_latents=None
     ):
         if not isinstance(timesteps, torch.Tensor):
             timesteps = self.scheduler.timesteps
-        for step_index, timestep in enumerate(timesteps):
-            latent_model_input = torch.cat([latents] * 2)
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep)
-            sample_inp = device_view(latent_model_input)
-            timestep_inp = device_view(timestep_float)
-            embeddings_inp = device_view(text_embeddings)
+        
+        # modify
+        bsz_x_frames, channel, width, height = latents.shape
+        bsz = bsz_x_frames // self.frame_num
+        latents = latents.reshape(bsz, self.frame_num, channel, width, height).permute(0, 2, 1, 3, 4)
+        
+        num_inference_steps = len(timesteps)
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for step_index, timestep in enumerate(timesteps):
+                # Expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep)
+                if isinstance(mask, torch.Tensor):
+                    latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+
+                # Predict the noise residual
+                timestep_float = timestep.float() if timestep.dtype != torch.float32 else timestep
+
+                sample_inp = device_view(latent_model_input)
+                timestep_inp = device_view(timestep_float)
+                embeddings_inp = device_view(text_embeddings)
+                noise_pred = runEngine(
+                    self.engine["unet"],
+                    {"sample": sample_inp, "timestep": timestep_inp, "encoder_hidden_states": embeddings_inp},
+                    self.stream,
+                )["latent"]
+
+                # Perform guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
+                
+                # call the callback, if provided
+                if step_index == len(timesteps) - 1 or ((step_index + 1) > num_warmup_steps and (step_index + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        latents = 1.0 / 0.18215 * latents
+        return latents
+
+    def __decode_latent(self, latents):
+        # change from (b, c, f, w, h) -> (b*f, c, w, h)
+        bsz, channel, frames, width, height = latents.shape
+        latents = latents.permute(0, 2, 1, 3, 4).reshape(bsz * frames, channel, width, height)
+        
+        images = runEngine(self.engine["vae"], {"latent": device_view(latents)}, self.stream)["images"]
+        images = (images / 2 + 0.5).clamp(0, 1)
+        
+        # change from (b*f, c, w, h) -> (b, c, f, w, h)
+        images = images.reshape([bsz, frames, 3] + list(images.shape)[-2:]).permute(0, 2, 1, 3, 4)
+        
+        return images
+
+
+    def __loadResources(self, frame_num, image_height, image_width, batch_size):
+        self.stream = cuda.Stream()
+
+        # Allocate buffers for TensorRT engine bindings
+        for model_name, obj in self.models.items():
+            self.engine[model_name].allocate_buffers(
+                shape_dict=obj.get_shape_dict(batch_size, frame_num, image_height, image_width), device=self.torch_device
+            )
+
+    def __loadResources1(self):
+        print('test')
+
+    # def __denoise_latent(
+    #     self, latents, text_embeddings, timesteps=None, step_offset=0, mask=None, masked_image_latents=None
+    # ):
+    #     if not isinstance(timesteps, torch.Tensor):
+    #         timesteps = self.scheduler.timesteps
+    #     for step_index, timestep in enumerate(timesteps):
+    #         latent_model_input = torch.cat([latents] * 2)
+    #         latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep)
+    #         sample_inp = device_view(latent_model_input)
+    #         timestep_inp = device_view(timestep_float)
+    #         embeddings_inp = device_view(text_embeddings)
                         
+    def __call__(
+        self, 
+        prompt: Union[str, List[str]] = None,
+        strength: float = 0.8,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        ):
+        
+        self.generator = generator
+        self.denoising_steps = num_inference_steps
+        self.guidance_scale = guidance_scale
+        
+        batch_size = 1
+        
+        # Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+            prompt = [prompt]
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            raise ValueError(f"Expected prompt to be of type list or str but got {type(prompt)}")
+
+        if negative_prompt is None:
+            negative_prompt = [""] * batch_size
+
+        if negative_prompt is not None and isinstance(negative_prompt, str):
+            negative_prompt = [negative_prompt]
+
+        assert len(prompt) == len(negative_prompt)
+        
+        self.__loadResources(self.frame_num, self.image_height, self.image_width, batch_size)
+        with torch.inference_mode(), torch.autocast("cuda"), trt.Runtime(TRT_LOGGER):
+            
+            timesteps, t_start = self.__initialize_timesteps(self.denoising_steps, strength)
+            latent_timestep = timesteps[:1].repeat(batch_size)
+            
+            
+            init_image = torch.rand([self.frame_num, 3, self.image_width, self.image_height]).cuda()
+            
+            # VAE encode init image
+            init_latents = self.__encode_image(init_image)
+
+
+            # Add noise to latents using timesteps
+            noise = torch.randn(
+                init_latents.shape, generator=self.generator, device=self.torch_device, dtype=torch.float32
+            )
+            latents = self.scheduler.add_noise(init_latents, noise, latent_timestep)
+
+
+            # CLIP text encoder
+            text_embeddings = self.__encode_prompt(prompt, negative_prompt)
+            
+            # UNet denoiser
+            latents = self.__denoise_latent(latents, text_embeddings, timesteps=timesteps, step_offset=t_start)
+            
+            # VAE decode latent
+            video_tensor = self.__decode_latent(latents)   
+            
+            video = tensor2vid(video_tensor)  
+            
+            return TextToVideoSDPipelineOutput(frames=video)       
+            
+            print('xxx')
             
                     
 
@@ -928,9 +1205,26 @@ v2v_pipe = TensorRTVideoToVideoSDPipeline(
     image_width=512
 )
 
+# v2v_pipe.__loadResources1()
+# v2v_pipe.loadResources(512, 512, 1)
+
 v2v_pipe.set_cached_folder('/workspace/code/aigc/text2video/AIGCVideo/Demo/zeroscope/xxx')
 v2v_pipe.to('cuda')
 
-text_embedding = 
+
+prompt = "Darth Vader surfing a wave"
+# v2v_pipe(prompt)
+
+
+
+beg = time.time()
+video_frames = v2v_pipe(prompt, strength=1).frames
+end = time.time()
+
+print('time elapsed:\t{:.4f}s'.format(end-beg))
+
+video_path = export_to_video(video_frames, output_video_path="./video_12_512_512_trt.mp4")
+
+# text_embedding = 
 
 print('congratulations!')

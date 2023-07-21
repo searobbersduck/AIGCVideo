@@ -9,6 +9,8 @@ __pycache__/
 Demo/zeroscope/xxx
 Demo/zeroscope/xxx/*
 
+*.mp4
+
 
 # C extensions
 *.so
