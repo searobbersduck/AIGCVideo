@@ -4,8 +4,13 @@
 
 * [cerspense/zeroscope_v2_XL](https://huggingface.co/cerspense/zeroscope_v2_XL)
 * [cerspense/zeroscope_v2_576w](https://huggingface.co/cerspense/zeroscope_v2_576w)
+* [Text-to-video synthesis](https://huggingface.co/docs/diffusers/main/en/api/pipelines/text_to_video#diffusers.VideoToVideoSDPipeline.__call__)
+    * 这里也可以找到上面两个链接的代码调用
 
-## 
+
+<br>
+
+## 代码实现逻辑
 
 首先对比[`stable_diffusion_tensorrt_img2img.py`](https://github.com/huggingface/diffusers/blob/main/examples/community/stable_diffusion_tensorrt_img2img.py)和[`pipeline_stable_diffusion_img2img.py`](https://github.com/huggingface/diffusers/blob/716286f19ddd9eb417113e064b538706884c8e73/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_img2img.py#L92)的实现。
 

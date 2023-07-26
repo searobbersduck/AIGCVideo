@@ -1,0 +1,3 @@
+[submodule "Demo/videocomposer/videocomposer"]
+	path = Demo/videocomposer/videocomposer
+	url = https://github.com/searobbersduck/videocomposer.git
